@@ -1,14 +1,21 @@
+#include <dummy.h>
+#include "BluetoothSerial.h"
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
+#endif
+
 /*
   What: LEDLightBoxAlnitak - PC controlled lightbox implmented using the
-  Alnitak (Flip-Flat/Flat-Man) command set found here:
-  https://www.optecinc.com/astronomy/catalog/alnitak/resources/Alnitak_GenericCommandsR4.pdf
-
+    Alnitak (Flip-Flat/Flat-Man) command set found here:
+    https://www.optecinc.com/astronomy/catalog/alnitak/resources/Alnitak_GenericCommandsR4.pdf
   Who:
-  Created By: Jared Wellman - jared@mainsequencesoftware.com
-  Adapted to V4 protocol, motor handling added By: Igor von Nyssen - igor@vonnyssen.com
+    Created By: Jared Wellman - jared@mainsequencesoftware.com
+    Modified By: Robert Pascale - implemented the PWM code for 31kHz - reverted from the V4 protocol as it was flaky.
+    Modified By: Adam Fenn - made it work with the ESP32
 
   When:
-  Last modified:  2020/January/19
+    Last modified:  2020/Jul/28
 
 
   Typical usage on the command prompt:
@@ -26,81 +33,78 @@
 
   Send     : >DOOO\r      //turn light off (brightness value should not be changed)
   Recieve  : *D19OOO\n    //confirms light turned off.
-
-  Tested with this stepper motor: https://smile.amazon.com/gp/product/B01CP18J4A/ref=ppx_yo_dt_b_search_asin_title?ie=UTF8&psc=1
-  and these boards
-   Arduino Uno - https://smile.amazon.com/gp/product/B01EWOE0UU/ref=ppx_yo_dt_b_search_asin_title?ie=UTF8&psc=1
-   Arduino Leonardo - https://smile.amazon.com/gp/product/B00R237VGO/ref=ppx_yo_dt_b_search_asin_title?ie=UTF8&psc=1
-
-  and NINA imaging software: https://nighttime-imaging.eu
 */
 
-#include <Stepper.h>
-
-#define STEPS 2038 // steps per revolution for the motor
-#define RPMS 1 // desired motor speed
-
-Stepper stepper(STEPS, 8, 10, 9, 11); //adjust to the pin sequence for your motor
-
 volatile int ledPin = 13;      // the pin that the LED is attached to, needs to be a PWM pin.
-int brightness = 0;
+int brightness = 0; // what NINA sends us and we need to translate to the higher resolution we use internally
+int translatedBrightness = 0; // what we actually set the led to, which uses a logarithmic scale
 
-enum devices {
+// setting PWM properties
+const int freq = 10000; // need to test this to see if it's high enough
+const int ledChannel = 0;
+const int resolution = 14;
+BluetoothSerial BT; // Bluetooth Object
+
+
+enum devices
+{
   FLAT_MAN_L = 10,
   FLAT_MAN_XL = 15,
   FLAT_MAN = 19,
   FLIP_FLAT = 99
 };
 
-enum motorStatuses {
+enum motorStatuses
+{
   STOPPED = 0,
   RUNNING
 };
 
-enum lightStatuses {
+enum lightStatuses
+{
   OFF = 0,
   ON
 };
 
-enum shutterStatuses {
-  NEITHER_OPEN_NOR_CLOSED = 0, // ie not open or closed...could be moving
+enum shutterStatuses
+{
+  UNKNOWN = 0, // ie not open or closed...could be moving
   CLOSED,
-  OPEN,
-  TIMED_OUT
-};
-
-enum motorDirection {
-  OPENING = 0,
-  CLOSING,
-  NONE
+  OPEN
 };
 
 
-int deviceId = FLIP_FLAT; //set this to FLAT_MAN if you want to remove or not use the motor handling
+int deviceId = FLAT_MAN;
 int motorStatus = STOPPED;
 int lightStatus = OFF;
-int coverStatus = CLOSED;
-float targetAngle = 0.0;
-float currentAngle = 0.0;
-int motorDirection = NONE;
+int coverStatus = UNKNOWN;
 
-void setup() {
+void setup()
+{
+
   // initialize the serial communication:
-  Serial.begin(9600);
-  // initialize the ledPin as an output:
-  pinMode(ledPin, OUTPUT);
-  analogWrite(ledPin, 0);
-  stepper.setSpeed(RPMS);
+  Serial.begin(9600); // Not sure this is needed but it's not hurting anything
+  BT.begin("FLAT");
+  Serial.println("The device started, now you can pair it with bluetooth!");
+  
+  // configure LED PWM functionalitites
+  ledcSetup(ledChannel, freq, resolution);
+  
+  // attach the channel to the GPIO to be controlled
+  ledcAttachPin(ledPin, ledChannel);
 }
 
-void loop() {
+void loop()
+{
   handleSerial();
-  handleMotor();
 }
 
 
-void handleSerial() {
-  if ( Serial.available() >= 6 ) { // all incoming communications are fixed length at 6 bytes including the \n
+void handleSerial()
+{
+  if ( BT.available() >= 6 ) // all incoming communications are fixed length at 6 bytes including the \n
+  
+  {
     char* cmd;
     char* data;
     char temp[10];
@@ -109,180 +113,159 @@ void handleSerial() {
 
     char str[20];
     memset(str, 0, 20);
-    Serial.readBytesUntil('\r', str, 20);
+
+    BT.readBytesUntil('\r', str, 20);
 
     cmd = str + 1;
     data = str + 2;
-
-    // useful for debugging to make sure your commands came through and are parsed correctly.
-    if ( false ) {
-      sprintf( temp, "cmd = >%c%s\n", cmd, data);
-      Serial.write(temp);
-    }
 
     switch ( *cmd )
     {
       /*
         Ping device
         Request: >POOO\r
-        Return : *PiiOOO\n
-        id = deviceId
+        Return : *PidOOO\n
+          id = deviceId
       */
       case 'P':
-        sprintf(temp, "*P%dOOO\n", deviceId);
-        Serial.write(temp);
+        sprintf(temp, "*P%dOOO\n", deviceId); // MADE CHANGE FROM PRINTLN TO PRINT HERE
+        BT.print(temp);
         break;
 
       /*
         Open shutter
         Request: >OOOO\r
-        Return : *OiiOOO\n
+        Return : *OidOOO\n
         id = deviceId
 
-        This command is only supported on the Flip-Flat, set the deviceId accordingly
+        This command is only supported on the Flip-Flat!
       */
       case 'O':
-        sprintf(temp, "*O%dOOO\n", deviceId);
-        setShutter(OPEN);
-        Serial.write(temp);
+        sprintf(temp, "*O%dOOO\n", deviceId); // MADE CHANGE FROM PRINTLN TO PRINT HERE
+        SetShutter(OPEN);
+        BT.print(temp);
         break;
 
 
       /*
         Close shutter
         Request: >COOO\r
-        Return : *CiiOOO\n
+        Return : *CidOOO\n
         id = deviceId
 
-        This command is only supported on the Flip-Flat, set the deviceId accordingly
+        This command is only supported on the Flip-Flat!
       */
       case 'C':
-        sprintf(temp, "*C%dOOO\n", deviceId);
-        setShutter(CLOSED);
-        Serial.write(temp);
+        sprintf(temp, "*C%dOOO\n", deviceId); // MADE CHANGE FROM PRINTLN TO PRINT HERE
+        SetShutter(CLOSED);
+        BT.print(temp);
         break;
 
       /*
         Turn light on
         Request: >LOOO\r
-        Return : *LiiOOO\n
-        id = deviceId
+        Return : *LidOOO\n
+          id = deviceId
       */
       case 'L':
-        sprintf(temp, "*L%dOOO\n", deviceId);
-        Serial.write(temp);
+        sprintf(temp, "*L%dOOO\n", deviceId);     // MADE CHANGE FROM PRINTLN TO PRINT HERE
+        BT.print(temp);
         lightStatus = ON;
-        analogWrite(ledPin, brightness);
+        ledcWrite(ledChannel, brightness);
         break;
 
       /*
         Turn light off
         Request: >DOOO\r
-        Return : *DiiOOO\n
-        id = deviceId
+        Return : *DidOOO\n
+          id = deviceId
       */
       case 'D':
-        sprintf(temp, "*D%dOOO\n", deviceId);
-        Serial.write(temp);
+        sprintf(temp, "*D%dOOO\n", deviceId); // MAKING TEST CHANGE HERE WITH THE REMOVAL OF PRINTLN AND REPLACING WITH JUST THE NEW LINE CHARACTER
+        BT.print(temp);
         lightStatus = OFF;
-        analogWrite(ledPin, 0);
+        ledcWrite(ledChannel, 0);
         break;
 
       /*
         Set brightness
         Request: >Bxxx\r
-         xxx = brightness value from 000-255
+          xxx = brightness value from 000-255
         Return : *Biiyyy\n
-        id = deviceId
-         yyy = value that brightness was set from 000-255
+          id = deviceId
+          yyy = value that brightness was set from 000-255
       */
       case 'B':
         brightness = atoi(data);
-        if ( lightStatus == ON )
-          analogWrite(ledPin, brightness);
-        sprintf( temp, "*B%d%03d\n", deviceId, brightness );
-        Serial.write(temp);
+        translatedBrightness = .0945 + .055 * pow(brightness +3, 2.269846108);  // Stretching the values so we have finer granularity at the dim levels
+        if (translatedBrightness > 16383)
+          translatedBrightness = 16383;
+        if ( lightStatus == ON ) 
+          ledcWrite(ledChannel, translatedBrightness);
+        sprintf( temp, "*B%d%03d\n", deviceId, brightness ); // MADE CHANGE FROM PRINTLN TO PRINT HERE
+        BT.print(temp);
         break;
 
       /*
         Get brightness
         Request: >JOOO\r
         Return : *Jiiyyy\n
-        id = deviceId
-         yyy = current brightness value from 000-255
+          id = deviceId
+          yyy = current brightness value from 000-255
       */
       case 'J':
-        sprintf( temp, "*J%d%03d\n", deviceId, brightness);
-        Serial.write(temp);
+        sprintf(temp, "*J%d%03d\n", deviceId, brightness); // MADE CHANGE FROM PRINTLN TO PRINT HERE
+        BT.print(temp);
         break;
 
       /*
         Get device status:
         Request: >SOOO\r
         Return : *SidMLC\n
-        id = deviceId
-         M  = motor status( 0 stopped, 1 running)
-         L  = light status( 0 off, 1 on)
-         C  = Cover Status( 0 moving, 1 closed, 2 open, 3 timed out)
+          id = deviceId
+          M  = motor status( 0 stopped, 1 running)
+          L  = light status( 0 off, 1 on)
+          C  = Cover Status( 0 moving, 1 closed, 2 open)
       */
       case 'S':
-        sprintf( temp, "*S%d%d%d%d\n", deviceId, motorStatus, lightStatus, coverStatus);
-        Serial.write(temp);
+        sprintf( temp, "*S%d%d%d%d\n", deviceId, motorStatus, lightStatus, coverStatus); // MADE CHANGE FROM PRINTLN TO PRINT HERE
+        BT.print(temp);
         break;
 
       /*
         Get firmware version
         Request: >VOOO\r
         Return : *Vii001\n
-        id = deviceId
+          id = deviceId
       */
       case 'V': // get firmware version
-        sprintf(temp, "*V%d003\n", deviceId);
-        Serial.write(temp);
+        sprintf(temp, "*V%d001\n", deviceId);   // MADE CHANGE FROM PRINTLN TO PRINT HERE
+        BT.print(temp);
         break;
     }
 
-    while ( Serial.available() > 0 ) {
-      Serial.read();
-    }
+    while ( BT.available() > 0 )
+      BT.read();
+
   }
 }
 
-void setShutter(int val)
+void SetShutter(int val)
 {
   if ( val == OPEN && coverStatus != OPEN )
   {
-    motorDirection = OPENING;
-    targetAngle = 90.0;
+    coverStatus = OPEN;
+    // TODO: Implement code to OPEN the shutter.
   }
   else if ( val == CLOSED && coverStatus != CLOSED )
   {
-    motorDirection = CLOSING;
-    targetAngle = 0.0;
+    coverStatus = CLOSED;
+    // TODO: Implement code to CLOSE the shutter
   }
-}
+  else
+  {
+    // TODO: Actually handle this case
+    coverStatus = val;
+  }
 
-void handleMotor()
-{
-  if (currentAngle < targetAngle && motorDirection == OPENING) {
-    motorStatus = RUNNING;
-    coverStatus = NEITHER_OPEN_NOR_CLOSED;
-    stepper.step(1);
-    currentAngle = currentAngle + 360.0 / STEPS;
-    if (currentAngle >= targetAngle) {
-      motorStatus = STOPPED;
-      motorDirection = NONE;
-      coverStatus = OPEN;
-    }
-  } else if (currentAngle > targetAngle && motorDirection == CLOSING) {
-    motorStatus = RUNNING;
-    coverStatus = NEITHER_OPEN_NOR_CLOSED;
-    stepper.step(-1);
-    currentAngle = currentAngle - 360.0 / STEPS;
-    if (currentAngle <= targetAngle) {
-      motorStatus = STOPPED;
-      motorDirection = NONE;
-      coverStatus = CLOSED;
-    }
-  }
 }
