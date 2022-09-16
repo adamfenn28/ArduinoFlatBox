@@ -36,12 +36,13 @@
 */
 
 volatile int ledPin = 13;      // the pin that the LED is attached to, needs to be a PWM pin.
-int brightness = 0;
+int brightness = 0; // what NINA sends us and we need to translate to the higher resolution we use internally
+int translatedBrightness = 0; // what we actually set the led to, which uses a logarithmic scale
 
 // setting PWM properties
-const int freq = 5000; // need to test this to see if it's high enough
+const int freq = 10000; // need to test this to see if it's high enough
 const int ledChannel = 0;
-const int resolution = 8;
+const int resolution = 14;
 BluetoothSerial BT; // Bluetooth Object
 
 
@@ -196,8 +197,11 @@ void handleSerial()
       */
       case 'B':
         brightness = atoi(data);
+        translatedBrightness = .75 + .25 * pow(brightness, 2.0014);
+        if (translatedBrightness > 16383)
+          translatedBrightness = 16383;
         if ( lightStatus == ON ) 
-          ledcWrite(ledChannel, brightness);
+          ledcWrite(ledChannel, translatedBrightness);
         sprintf( temp, "*B%d%03d\n", deviceId, brightness ); // MADE CHANGE FROM PRINTLN TO PRINT HERE
         BT.print(temp);
         break;
